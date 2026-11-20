@@ -51,21 +51,24 @@ void filter_hunk(uint8_t *output, const uint8_t *source, unsigned count, unsigne
     output[1] = (uint8_t)cdda;
 }
 
-int unfilter_hunk(uint8_t *data, unsigned count, unsigned stride)
+int filter_masks_valid(const uint8_t *data, unsigned count)
 {
     unsigned ecc = data[0], cdda = data[1];
-    if (ecc & cdda || ((ecc | cdda) >> count))
-        return 0;
-    data += PSXRC_FILTER_BYTES;
-    for (unsigned i = 0; i < count; ++i, data += stride) {
-        unsigned bit = 1u << i;
-        if (ecc & bit) {
-            if (data[15] != 2 || (data[18] & 0x20))
-                return 0;
-            str_write_integrity(data);
-        } else if (cdda & bit) {
-            join_deltas(data);
-        }
+    return !(ecc & cdda) && !((ecc | cdda) >> count);
+}
+
+int unfilter_sector(uint8_t *hunk, unsigned index, unsigned stride)
+{
+    unsigned bit = 1u << index;
+    uint8_t *data = hunk + PSXRC_FILTER_BYTES + index * stride;
+    if (hunk[0] & bit) {
+        if (data[15] != 2 || (data[18] & 0x20))
+            return 0;
+        str_write_integrity(data);
+        hunk[0] &= (uint8_t)~bit;
+    } else if (hunk[1] & bit) {
+        join_deltas(data);
+        hunk[1] &= (uint8_t)~bit;
     }
     return 1;
 }

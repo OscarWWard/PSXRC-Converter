@@ -17,6 +17,7 @@ typedef struct {
 
 /* Strict standard Mode 2 STR video sector with valid integrity fields. */
 int str_parse(const uint8_t sector[STR_SECTOR_BYTES], str_header *header);
+int str_parse_template(const uint8_t sector[STR_SECTOR_BYTES], str_header *header);
 int str_same_frame(const str_header *a, const str_header *b);
 uint32_t str_edc(const uint8_t *data, size_t size);
 void str_write_integrity(uint8_t sector[STR_SECTOR_BYTES]);

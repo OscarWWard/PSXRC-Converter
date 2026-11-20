@@ -81,7 +81,7 @@ int str_form1_integrity(const uint8_t sector[STR_SECTOR_BYTES])
     return !memcmp(reference + FORM1_EDC, sector + FORM1_EDC, STR_SECTOR_BYTES - FORM1_EDC);
 }
 
-int str_parse(const uint8_t sector[STR_SECTOR_BYTES], str_header *header)
+int str_parse_template(const uint8_t sector[STR_SECTOR_BYTES], str_header *header)
 {
     static const uint8_t sync[] = {
         0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0
@@ -110,6 +110,13 @@ int str_parse(const uint8_t sector[STR_SECTOR_BYTES], str_header *header)
         !header->height || header->height > 1024 || header->height % 2 ||
         !header->words || header->words % 32 || !header->quant || header->quant > 63 ||
         (header->version != 2 && header->version != 3))
+        return 0;
+    return 1;
+}
+
+int str_parse(const uint8_t sector[STR_SECTOR_BYTES], str_header *header)
+{
+    if (!str_parse_template(sector, header))
         return 0;
     if (sector[SUBHEADER + 2] & 0x20) {
         uint32_t edc = read32(sector + FORM2_EDC);

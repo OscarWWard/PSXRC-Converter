@@ -248,15 +248,25 @@ const psxrc_track *psxrc_get_track(const psxrc *image, unsigned number)
     return number && number <= image->tracks ? &image->track[number - 1] : NULL;
 }
 
-static const uint8_t *read_template(psxrc *image, uint32_t lba)
+static const uint8_t *sector_from_hunk(psxrc *image, hunk_cache *cache, unsigned index,
+                                      int restore, int *omitted_ecc)
+{
+    if (omitted_ecc)
+        *omitted_ecc = image->filter_bytes && (cache->data[0] & (1u << index));
+    if (restore && image->filter_bytes && !unfilter_sector(cache->data, index, image->sector_bytes))
+        return NULL;
+    return cache->data + index * image->sector_bytes + image->filter_bytes;
+}
+
+static const uint8_t *read_template(psxrc *image, uint32_t lba, int restore, int *omitted_ecc)
 {
     if (lba >= image->sectors)
         return NULL;
     uint32_t i = lba / PSXRC_HUNK_SECTORS;
-    unsigned offset = lba % PSXRC_HUNK_SECTORS * image->sector_bytes + image->filter_bytes;
+    unsigned index = lba % PSXRC_HUNK_SECTORS;
     for (unsigned slot = 0; slot < HUNK_CACHE_SIZE; ++slot)
         if (image->cached_hunks[slot].index == i)
-            return image->cached_hunks[slot].data + offset;
+            return sector_from_hunk(image, &image->cached_hunks[slot], index, restore, omitted_ecc);
     hunk_cache *cache = &image->cached_hunks[image->next_hunk++ % HUNK_CACHE_SIZE];
     cache->index = PSXRC_NO_INDEX;
     psxrc_record *r = &image->hunk[i];
@@ -269,10 +279,10 @@ static const uint8_t *read_template(psxrc *image, uint32_t lba)
                                                    compressed, r->bytes) != bytes))
         return NULL;
     if (image->filter_bytes &&
-        !unfilter_hunk(cache->data, (bytes - image->filter_bytes) / image->sector_bytes, image->sector_bytes))
+        !filter_masks_valid(cache->data, (bytes - image->filter_bytes) / image->sector_bytes))
         return NULL;
     cache->index = i;
-    return cache->data + offset;
+    return sector_from_hunk(image, cache, index, restore, omitted_ecc);
 }
 
 static group_cache *read_group(psxrc *image, uint32_t group)
@@ -411,20 +421,22 @@ static int overlay_audio(psxrc *image, const media_mapping *map, uint8_t *output
 
 int psxrc_read_sector(psxrc *image, uint32_t lba, uint8_t output[PSXRC_SECTOR_BYTES])
 {
-    const uint8_t *data = read_template(image, lba);
+    const media_mapping *map = find_mapping(image->video, image->videos, lba);
+    const media_mapping *audio = map ? NULL : find_mapping(image->audio, image->audios, lba);
+    int omitted_ecc = 0;
+    const uint8_t *data = read_template(image, lba, !map && !audio, &omitted_ecc);
     if (!data)
         return 0;
     memcpy(output, data, PSXRC_SECTOR_BYTES);
-    const media_mapping *map = find_mapping(image->video, image->videos, lba);
     if (!map) {
-        const media_mapping *audio = find_mapping(image->audio, image->audios, lba);
         if (audio)
             return overlay_audio(image, audio, output);
         return 1;
     }
     group_cache *cache = read_group(image, map->group);
     str_header h;
-    if (!cache || !str_parse(data, &h) || !read_frame(image, cache, map->frame) ||
+    int valid = omitted_ecc ? !(data[18] & 0x20) && str_parse_template(data, &h) : str_parse(data, &h);
+    if (!cache || !valid || !read_frame(image, cache, map->frame) ||
         cache->length[map->frame] > h.length || cache->width != h.width || cache->height != h.height ||
         read16(cache->frame[map->frame]) > h.words || read16(cache->frame[map->frame] + 6) != h.version)
         return 0;
@@ -436,7 +448,7 @@ int psxrc_read_subchannel(psxrc *image, uint32_t lba, uint8_t output[PSXRC_SUB_B
 {
     if (!psxrc_has_subchannel(image))
         return 0;
-    const uint8_t *data = read_template(image, lba);
+    const uint8_t *data = read_template(image, lba, 0, NULL);
     if (!data || data[PSXRC_SECTOR_BYTES] != 1)
         return 0;
     memcpy(output, data + PSXRC_SECTOR_BYTES + 1, PSXRC_SUB_BYTES);

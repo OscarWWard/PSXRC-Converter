@@ -162,8 +162,20 @@ static void encode_block(bit_writer *w, const bs_picture *picture, unsigned plan
         for (unsigned y = 0; y < 4; ++y)
             sum += (int64_t)vertical[v & 1][u][y] * basis[v][y];
         int coefficient = divide_round(sum, 1 << 28);
-        int level = i ? divide_round(coefficient * 8, (int)quant * quant_matrix[position])
-                      : divide_round(coefficient, 2);
+        int level;
+        if (i) {
+            int divisor = (int)quant * quant_matrix[position];
+            int magnitude = (coefficient < 0 ? -coefficient : coefficient) * 8 + divisor / 2;
+            if (magnitude < divisor) {
+                ++run;
+                continue;
+            }
+            level = magnitude / divisor;
+            if (coefficient < 0)
+                level = -level;
+        } else {
+            level = divide_round(coefficient, 2);
+        }
         if (level < -512)
             level = -512;
         if (level > 510)
