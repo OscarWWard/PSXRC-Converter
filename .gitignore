@@ -1,0 +1,5 @@
+/build*/
+*.psxrc
+*.bin
+*.chd
+__pycache__/
