@@ -122,8 +122,8 @@ static int rebuild(enum audio_kind kind, unsigned channels, const int16_t *pcm,
     return 1;
 }
 
-int audio_unpack(const uint8_t *group, size_t bytes, uint8_t *sectors,
-                 enum audio_kind *kind, unsigned *coding, unsigned *units)
+int audio_unpack_pcm(const uint8_t *group, size_t bytes, int16_t *pcm,
+                     enum audio_kind *kind, unsigned *coding, unsigned *units)
 {
     if (bytes < AUDIO_HEADER)
         return 0;
@@ -136,15 +136,18 @@ int audio_unpack(const uint8_t *group, size_t bytes, uint8_t *sectors,
         return 0;
     unsigned samples = audio_samples_per_unit(*kind, *coding);
     unsigned channels = audio_channels(*kind, *coding);
-    int16_t *pcm = malloc(*units * samples * channels * sizeof(*pcm));
-    if (!pcm)
+    if (*units * samples * channels > AUDIO_MAX_PCM_VALUES)
         return 0;
-    int ok = decode_pcm(group + AUDIO_HEADER, bytes - AUDIO_HEADER, group[3], read16(group + 4),
-                        audio_rate(*kind, *coding), channels, pcm, *units * samples, read16(group + 6)) &&
-             rebuild(*kind, channels, pcm, samples, *units, sectors) &&
-             av_adler32_update(1, sectors, *units * AUDIO_UNIT_BYTES) == read32(group + 8);
-    free(pcm);
-    return ok;
+    return decode_pcm(group + AUDIO_HEADER, bytes - AUDIO_HEADER, group[3], read16(group + 4),
+                      audio_rate(*kind, *coding), channels, pcm, *units * samples, read16(group + 6));
+}
+
+int audio_rebuild(enum audio_kind kind, unsigned coding, unsigned units,
+                  const int16_t *pcm, uint8_t *sectors, uint32_t checksum)
+{
+    return rebuild(kind, audio_channels(kind, coding), pcm, audio_samples_per_unit(kind, coding),
+                   units, sectors) &&
+           av_adler32_update(1, sectors, units * AUDIO_UNIT_BYTES) == checksum;
 }
 
 static int quality_passes(const int16_t *original, const int16_t *rebuilt, unsigned samples,

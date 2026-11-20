@@ -4,7 +4,7 @@ All integers are little-endian. Disc LBA 0 corresponds to MSF 00:02:00. Byte off
 
 ## Header and index
 
-The 48-byte header contains the eight-byte signature `50 53 58 52 43 0d 0a 1a`, followed by ten 32-bit values. These are version, flags, sector count, track count, hunk count, video LBA count, video group count, index Adler-32, audio LBA count, and audio group count. The initial Adler-32 state is 1. Flag bit 0 enables subchannel records. Flag bit 1 enables an SBI bitmap. Flag bit 2 enables two lossless sector-filter mask bytes at the start of each decoded hunk.
+The 48-byte header contains the eight-byte signature `50 53 58 52 43 0d 0a 1a`, followed by ten 32-bit values. These are version, flags, sector count, track count, hunk count, video LBA count, video group count, index Adler-32, audio LBA count, and audio group count. The initial Adler-32 state is 1. Flag bit 0 enables subchannel records. Flag bit 1 enables an SBI bitmap. Flag bit 2 enables two lossless sector-filter mask bytes at the start of each decoded hunk. Flag bit 3 enables MDEC hints at the end of each video group.
 
 | Index section | Entry |
 | --- | --- |
@@ -25,6 +25,8 @@ In a filtered hunk, the first mask marks Mode 2 Form 1 sectors whose 280 EDC/ECC
 Each video group begins with four 16-bit values for frame count (1–4), width, height, and a reserved zero. It starts with an IDR access unit containing parameter sets. Following frames may reference earlier frames in the group. Store one Annex B access unit per frame, in decode order.
 
 Each access unit is preceded by a 20-byte frame record containing 8-bit quantization and BS version, a 16-bit MDEC word budget, and four 32-bit values. The 32-bit values give the access unit size, original frame byte budget, reconstructed BS size, and Adler-32 of reconstructed BS bytes.
+
+When bit 3 is set, append one 12-byte hint per frame in decode order after the last access unit. Each hint consists of a 64-bit FNV-1a fingerprint followed by the 32-bit count of 16-bit run-length words. Hash each expanded MDEC word in little-endian byte order, including DC quantizer bits and one end-of-block word for each block. Exclude DMA padding and the BS end-of-frame marker. The video group record size and Adler-32 cover the hint trailer. A reader can ignore a hint that disagrees with the reconstructed frame and retain normal STR playback.
 
 The hunk stores each original STR sector with the replaced frame bytes zeroed. The reader decodes the corresponding access units, re-encodes BS with the recorded quantization setting, and validates size and checksum. It overlays the frame at the original STR chunk offset, updates the duplicate header fields, and regenerates Form 1 EDC/ECC or any present Form 2 EDC.
 

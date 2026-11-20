@@ -11,6 +11,68 @@
 #define tell_impl ftello
 #endif
 
+#ifdef _WIN32
+static wchar_t *file_wide(const char *text)
+{
+    unsigned codepage = CP_UTF8;
+    int count = MultiByteToWideChar(codepage, MB_ERR_INVALID_CHARS, text, -1, NULL, 0);
+    if (!count) {
+        codepage = CP_ACP;
+        count = MultiByteToWideChar(codepage, 0, text, -1, NULL, 0);
+    }
+    wchar_t *wide = count ? malloc((size_t)count * sizeof(*wide)) : NULL;
+    if (wide && !MultiByteToWideChar(codepage, 0, text, -1, wide, count)) {
+        free(wide);
+        return NULL;
+    }
+    return wide;
+}
+
+char *file_utf8(const wchar_t *text)
+{
+    int count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, -1, NULL, 0, NULL, NULL);
+    char *out = count ? malloc((size_t)count) : NULL;
+    if (out && !WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, -1, out, count, NULL, NULL)) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
+char *file_normalize_utf8(const char *text)
+{
+    wchar_t *wide = file_wide(text);
+    char *utf8 = wide ? file_utf8(wide) : NULL;
+    free(wide);
+    return utf8;
+}
+#endif
+
+FILE *file_open(const char *path, const char *mode)
+{
+#ifdef _WIN32
+    wchar_t *wide_path = file_wide(path), *wide_mode = file_wide(mode);
+    FILE *file = wide_path && wide_mode ? _wfopen(wide_path, wide_mode) : NULL;
+    free(wide_path);
+    free(wide_mode);
+    return file;
+#else
+    return fopen(path, mode);
+#endif
+}
+
+int file_remove(const char *path)
+{
+#ifdef _WIN32
+    wchar_t *wide = file_wide(path);
+    int result = wide ? _wremove(wide) : -1;
+    free(wide);
+    return result;
+#else
+    return remove(path);
+#endif
+}
+
 int file_size(FILE *file, uint64_t *size)
 {
     if (seek_impl(file, 0, SEEK_END) != 0)
@@ -46,7 +108,7 @@ FILE *file_create_temp(const char *path, char **temp_path)
         unsigned long pid = (unsigned long)getpid();
 #endif
         snprintf(name, size, "%s.%lu.%u.tmp", path, pid, i);
-        FILE *file = fopen(name, "w+bx");
+        FILE *file = file_open(name, "w+bx");
         if (file) {
             *temp_path = name;
             return file;
@@ -59,7 +121,11 @@ FILE *file_create_temp(const char *path, char **temp_path)
 int file_publish(const char *temp_path, const char *path)
 {
 #ifdef _WIN32
-    return MoveFileExA(temp_path, path, MOVEFILE_WRITE_THROUGH) != 0;
+    wchar_t *source = file_wide(temp_path), *destination = file_wide(path);
+    int moved = source && destination && MoveFileExW(source, destination, MOVEFILE_WRITE_THROUGH);
+    free(source);
+    free(destination);
+    return moved;
 #else
     if (link(temp_path, path) != 0)
         return 0;

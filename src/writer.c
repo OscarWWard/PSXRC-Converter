@@ -40,7 +40,7 @@ static void put_record(uint8_t *p, uint64_t offset, uint32_t bytes, uint32_t che
 static int append_group(video_plan *plan, video_frame *frame, unsigned count,
                         const convert_options *options)
 {
-    if (!video_convert(frame, count, options->crf, options->mse_limit))
+    if (!video_convert(frame, count, options))
         return 0;
     uint8_t group_header[8] = { 0 };
     write16(group_header, count);
@@ -70,6 +70,17 @@ static int append_group(video_plan *plan, video_frame *frame, unsigned count,
         for (unsigned n = 0; n < f->header.chunks; ++n) {
             plan->slot[f->lba[n]] = plan->groups * PSXRC_GROUP_FRAMES + i;
             ++plan->sectors;
+        }
+    }
+    if (options->mdec_hints) {
+        for (unsigned i = 0; i < count; ++i) {
+            uint8_t hint[PSXRC_MDEC_HINT_BYTES];
+            write64(hint, frame[i].mdec.hash);
+            write32(hint + 8, frame[i].mdec.words);
+            if (fwrite(hint, 1, sizeof(hint), plan->data) != sizeof(hint))
+                return 0;
+            checksum = av_adler32_update(checksum, hint, sizeof(hint));
+            size += sizeof(hint);
         }
     }
     plan->group[plan->groups++] = (psxrc_record){ plan->size, size, checksum };
@@ -441,7 +452,10 @@ static int write_contents(FILE *file, disc_source *source, video_plan *video,
     uint8_t header[PSXRC_HEADER_BYTES] = { 0 };
     memcpy(header, PSXRC_MAGIC, 8);
     write32(header + 8, PSXRC_VERSION);
-    write32(header + 12, source->flags | PSXRC_FLAG_FILTERS);
+    unsigned flags = source->flags | PSXRC_FLAG_FILTERS;
+    if (video->groups && options->mdec_hints)
+        flags |= PSXRC_FLAG_MDEC_HINTS;
+    write32(header + 12, flags);
     write32(header + 16, source->sectors);
     write32(header + 20, source->track_count);
     write32(header + 24, hunks);
@@ -494,6 +508,7 @@ int write_image(disc_source *source, const char *path, const convert_options *op
     FILE *file = NULL;
     int result = 0;
     if (options->count || options->auto_video) {
+        fputs("Scanning and encoding eligible movies...\n", stderr);
         video.data = file_create_temp(path, &spool);
         video.slot = malloc(source->sectors * sizeof(*video.slot));
         video.group = malloc(source->sectors * sizeof(*video.group));
@@ -505,6 +520,7 @@ int write_image(disc_source *source, const char *path, const convert_options *op
             goto done;
     }
     if (options->cdda || options->xa) {
+        fputs("Scanning and encoding eligible audio...\n", stderr);
         audio.data = file_create_temp(path, &audio_spool);
         audio.slot = malloc(source->sectors * sizeof(*audio.slot));
         audio.group = malloc(source->sectors * sizeof(*audio.group));
@@ -516,6 +532,7 @@ int write_image(disc_source *source, const char *path, const convert_options *op
             goto done;
     }
     int written;
+    fputs("Compressing disc hunks...\n", stderr);
     do {
         file = file_create_temp(path, &temp);
         if (!file)
@@ -524,7 +541,7 @@ int write_image(disc_source *source, const char *path, const convert_options *op
         if (written < 0) {
             fclose(file);
             file = NULL;
-            remove(temp);
+            file_remove(temp);
             free(temp);
             temp = NULL;
             if (-written & 1)
@@ -533,7 +550,10 @@ int write_image(disc_source *source, const char *path, const convert_options *op
                 audio.groups = audio.sectors = 0;
         }
     } while (written < 0);
-    if (!written || !verify_contents(file, source, &video, &audio))
+    if (!written)
+        goto done;
+    fputs("Verifying every sector...\n", stderr);
+    if (!verify_contents(file, source, &video, &audio))
         goto done;
     int closed = fclose(file);
     file = NULL;
@@ -547,19 +567,19 @@ done:
         fclose(file);
     if (temp) {
         if (!result)
-            remove(temp);
+            file_remove(temp);
         free(temp);
     }
     if (video.data)
         fclose(video.data);
     if (spool) {
-        remove(spool);
+        file_remove(spool);
         free(spool);
     }
     if (audio.data)
         fclose(audio.data);
     if (audio_spool) {
-        remove(audio_spool);
+        file_remove(audio_spool);
         free(audio_spool);
     }
     free(video.group);

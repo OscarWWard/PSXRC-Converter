@@ -7,6 +7,8 @@
 #include "xa.h"
 #include <libavutil/adler32.h>
 #include <zstd.h>
+#include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -33,14 +35,18 @@ typedef struct {
     uint8_t frame[PSXRC_GROUP_FRAMES][STR_MAX_FRAME_BYTES];
     size_t length[PSXRC_GROUP_FRAMES];
     frame_spec spec[PSXRC_GROUP_FRAMES];
+    psxrc_video_hint hints[PSXRC_GROUP_FRAMES];
+    AVFrame *decoded[PSXRC_GROUP_FRAMES];
     uint8_t *packets;
     unsigned width, height, count;
 } group_cache;
 
 typedef struct {
-    uint32_t index;
+    uint32_t index, checksum;
     unsigned coding, units;
     enum audio_kind kind;
+    int rebuilt;
+    int16_t pcm[AUDIO_MAX_PCM_VALUES];
     uint8_t data[AUDIO_MAX_UNITS * AUDIO_UNIT_BYTES];
 } audio_cache;
 
@@ -57,6 +63,7 @@ struct psxrc {
     group_cache cached_groups[GROUP_CACHE_SIZE];
     audio_cache cached_audio[GROUP_CACHE_SIZE];
     unsigned next_hunk, next_group, next_audio;
+    int trace_mdec, direct_video;
     uint32_t decoder_group;
     unsigned decoder_next;
     ZSTD_DCtx *zstd;
@@ -77,7 +84,8 @@ static int load_records(psxrc_record *records, const uint8_t *p, uint32_t count,
 {
     for (uint32_t i = 0; i < count; ++i, p += PSXRC_RECORD_BYTES) {
         uint32_t limit = type == 2 ? AUDIO_MAX_GROUP
-                       : type == 1 ? PSXRC_GROUP_FRAMES * (PSXRC_MAX_PACKET + PSXRC_FRAME_BYTES) + 8
+                       : type == 1 ? PSXRC_GROUP_FRAMES * (PSXRC_MAX_PACKET + PSXRC_FRAME_BYTES +
+                                     ((image->flags & PSXRC_FLAG_MDEC_HINTS) ? PSXRC_MDEC_HINT_BYTES : 0)) + 8
                                    : hunk_bytes(image, i);
         records[i] = (psxrc_record){ read64(p), read32(p + 8), read32(p + 12) };
         if (records[i].offset != *data_offset || !records[i].bytes ||
@@ -112,6 +120,8 @@ psxrc *psxrc_open(psxrc_read_at read_at, void *context, uint64_t size)
         return NULL;
     image->read_at = read_at;
     image->context = context;
+    const char *trace = getenv("PSXRC_TRACE_MDEC");
+    image->trace_mdec = trace && !strcmp(trace, "1");
     image->flags = read32(header + 12);
     image->sectors = read32(header + 16);
     image->tracks = read32(header + 20);
@@ -125,7 +135,7 @@ psxrc *psxrc_open(psxrc_read_at read_at, void *context, uint64_t size)
     image->filter_bytes = image->flags & PSXRC_FLAG_FILTERS ? PSXRC_FILTER_BYTES : 0;
     if (!image->sectors || image->sectors > PSXRC_MAX_SECTORS ||
         !image->tracks || image->tracks > PSXRC_MAX_TRACKS ||
-        image->flags & ~(PSXRC_FLAG_SUBCHANNEL | PSXRC_FLAG_SBI | PSXRC_FLAG_FILTERS) ||
+        image->flags & ~(PSXRC_FLAG_SUBCHANNEL | PSXRC_FLAG_SBI | PSXRC_FLAG_FILTERS | PSXRC_FLAG_MDEC_HINTS) ||
         image->hunks != (image->sectors + PSXRC_HUNK_SECTORS - 1) / PSXRC_HUNK_SECTORS ||
         image->videos > image->sectors || image->groups > image->videos ||
         image->audios > image->sectors - image->videos || image->audio_groups > image->audios ||
@@ -226,8 +236,11 @@ void psxrc_close(psxrc *image)
     free(image->audio_group);
     free(image->audio);
     free(image->sbi);
-    for (unsigned i = 0; i < GROUP_CACHE_SIZE; ++i)
+    for (unsigned i = 0; i < GROUP_CACHE_SIZE; ++i) {
         free(image->cached_groups[i].packets);
+        for (unsigned j = 0; j < PSXRC_GROUP_FRAMES; ++j)
+            av_frame_free(&image->cached_groups[i].decoded[j]);
+    }
     free(image);
 }
 
@@ -235,6 +248,7 @@ unsigned psxrc_track_count(const psxrc *image) { return image->tracks; }
 uint32_t psxrc_sector_count(const psxrc *image) { return image->sectors; }
 uint32_t psxrc_video_sector_count(const psxrc *image) { return image->videos; }
 uint32_t psxrc_audio_sector_count(const psxrc *image) { return image->audios; }
+int psxrc_has_mdec_hints(const psxrc *image) { return !!(image->flags & PSXRC_FLAG_MDEC_HINTS); }
 int psxrc_has_subchannel(const psxrc *image) { return !!(image->flags & PSXRC_FLAG_SUBCHANNEL); }
 
 const uint8_t *psxrc_sbi_bitmap(const psxrc *image, size_t *bytes)
@@ -293,6 +307,9 @@ static group_cache *read_group(psxrc *image, uint32_t group)
     group_cache *cache = &image->cached_groups[image->next_group++ % GROUP_CACHE_SIZE];
     cache->index = PSXRC_NO_INDEX;
     memset(cache->length, 0, sizeof(cache->length));
+    memset(cache->hints, 0, sizeof(cache->hints));
+    for (unsigned i = 0; i < PSXRC_GROUP_FRAMES; ++i)
+        av_frame_free(&cache->decoded[i]);
     const psxrc_record *record = &image->group[group];
     uint8_t *packets = realloc(cache->packets, record->bytes);
     if (!packets)
@@ -307,7 +324,10 @@ static group_cache *read_group(psxrc *image, uint32_t group)
     if (!count || count > PSXRC_GROUP_FRAMES || !width || width > 1024 || width % 2 ||
         !height || height > 1024 || height % 2 || read16(p + 6))
         return NULL;
-    const uint8_t *end = p + record->bytes;
+    unsigned hint_bytes = image->flags & PSXRC_FLAG_MDEC_HINTS ? count * PSXRC_MDEC_HINT_BYTES : 0;
+    if (hint_bytes > record->bytes - 8)
+        return NULL;
+    const uint8_t *end = p + record->bytes - hint_bytes;
     p += 8;
     for (unsigned i = 0; i < count; ++i) {
         if ((size_t)(end - p) < PSXRC_FRAME_BYTES)
@@ -324,6 +344,10 @@ static group_cache *read_group(psxrc *image, uint32_t group)
     }
     if (p != end)
         return NULL;
+    if (hint_bytes) {
+        for (unsigned i = 0; i < count; ++i, p += PSXRC_MDEC_HINT_BYTES)
+            cache->hints[i] = (psxrc_video_hint){ read64(p), read32(p + 8), width, height };
+    }
     cache->width = width;
     cache->height = height;
     cache->count = count;
@@ -331,7 +355,7 @@ static group_cache *read_group(psxrc *image, uint32_t group)
     return cache;
 }
 
-static int read_frame(psxrc *image, group_cache *cache, unsigned frame)
+static int read_frame(psxrc *image, group_cache *cache, unsigned frame, uint32_t lba)
 {
     if (frame >= cache->count)
         return 0;
@@ -358,10 +382,25 @@ static int read_frame(psxrc *image, group_cache *cache, unsigned frame)
     if (!codec_picture(image->picture, cache->width, cache->height, &pixels))
         return 0;
     const frame_spec *f = &cache->spec[frame];
-    size_t size = bs_encode(&pixels, f->version, f->quant, f->words, cache->frame[frame], f->capacity);
+    bs_mdec_fingerprint trace;
+    size_t size = bs_encode_fingerprint(&pixels, f->version, f->quant, f->words,
+                                       cache->frame[frame], f->capacity,
+                                       image->trace_mdec || image->direct_video ? &trace : NULL);
     if (!size || size != f->expected_size || av_adler32_update(1, cache->frame[frame], size) != f->checksum)
         return 0;
     cache->length[frame] = size;
+    if (image->direct_video) {
+        const psxrc_video_hint *hint = &cache->hints[frame];
+        if (!(image->flags & PSXRC_FLAG_MDEC_HINTS) ||
+            (hint->hash == trace.hash && hint->words == trace.words)) {
+            cache->hints[frame] = (psxrc_video_hint){ trace.hash, trace.words, cache->width, cache->height };
+            cache->decoded[frame] = av_frame_clone(image->picture);
+        }
+    }
+    if (image->trace_mdec)
+        fprintf(stderr, "PSXRC_STR lba=%" PRIu32 " group=%" PRIu32 " frame=%u bs=%u size=%ux%u words=%u quant=%u hash=%016" PRIx64 " coefficients=%016" PRIx64 "\n",
+                lba, cache->index, frame, f->version, cache->width, cache->height, trace.words,
+                f->quant, trace.hash, trace.coefficients);
     return 1;
 }
 
@@ -378,7 +417,58 @@ static const media_mapping *find_mapping(const media_mapping *map, uint32_t coun
     return first < count && map[first].lba == lba ? &map[first] : NULL;
 }
 
-static const audio_cache *read_audio(psxrc *image, uint32_t group)
+void psxrc_enable_direct_video(psxrc *image)
+{
+    image->direct_video = 1;
+}
+
+static group_cache *read_video_at(psxrc *image, uint32_t lba, unsigned *frame)
+{
+    if (!image->direct_video)
+        return NULL;
+    const media_mapping *map = find_mapping(image->video, image->videos, lba);
+    if (!map)
+        return NULL;
+    group_cache *cache = read_group(image, map->group);
+    if (!cache || !read_frame(image, cache, map->frame, lba))
+        return NULL;
+    *frame = map->frame;
+    return cache->decoded[*frame] ? cache : NULL;
+}
+
+int psxrc_read_video_hint(psxrc *image, uint32_t lba, psxrc_video_hint *hint)
+{
+    unsigned frame;
+    group_cache *cache = read_video_at(image, lba, &frame);
+    if (!cache)
+        return 0;
+    *hint = cache->hints[frame];
+    return 1;
+}
+
+int psxrc_copy_video(psxrc *image, uint32_t lba, const psxrc_video_hint *hint,
+                     uint8_t *pixels, size_t capacity)
+{
+    unsigned frame;
+    group_cache *cache = read_video_at(image, lba, &frame);
+    if (!cache || hint->width != cache->width || hint->height != cache->height ||
+        hint->hash != cache->hints[frame].hash || hint->words != cache->hints[frame].words ||
+        capacity < (size_t)cache->width * cache->height * 3 / 2)
+        return 0;
+    bs_picture picture;
+    if (!codec_picture(cache->decoded[frame], cache->width, cache->height, &picture))
+        return 0;
+    for (unsigned p = 0; p < 3; ++p) {
+        unsigned width = picture.width >> (p != 0), height = picture.height >> (p != 0);
+        for (unsigned y = 0; y < height; ++y) {
+            memcpy(pixels, picture.plane[p] + y * picture.stride[p], width);
+            pixels += width;
+        }
+    }
+    return 1;
+}
+
+static audio_cache *read_audio(psxrc *image, uint32_t group)
 {
     for (unsigned i = 0; i < GROUP_CACHE_SIZE; ++i)
         if (image->cached_audio[i].index == group)
@@ -389,17 +479,25 @@ static const audio_cache *read_audio(psxrc *image, uint32_t group)
     uint8_t compressed[AUDIO_MAX_GROUP];
     if (!image->read_at(image->context, r->offset, compressed, r->bytes) ||
         av_adler32_update(1, compressed, r->bytes) != r->checksum ||
-        !audio_unpack(compressed, r->bytes, cache->data, &cache->kind, &cache->coding, &cache->units))
+        !audio_unpack_pcm(compressed, r->bytes, cache->pcm, &cache->kind, &cache->coding, &cache->units))
         return NULL;
+    cache->checksum = read32(compressed + 8);
+    cache->rebuilt = 0;
     cache->index = group;
     return cache;
 }
 
 static int overlay_audio(psxrc *image, const media_mapping *map, uint8_t *output)
 {
-    const audio_cache *cache = read_audio(image, map->group);
+    audio_cache *cache = read_audio(image, map->group);
     if (!cache || map->frame >= cache->units)
         return 0;
+    if (!cache->rebuilt) {
+        if (!audio_rebuild(cache->kind, cache->coding, cache->units, cache->pcm,
+                           cache->data, cache->checksum))
+            return 0;
+        cache->rebuilt = 1;
+    }
     const uint8_t *audio = cache->data + map->frame * AUDIO_UNIT_BYTES;
     if (cache->kind == AUDIO_CDDA) {
         for (unsigned i = 0; i < image->tracks; ++i) {
@@ -419,6 +517,44 @@ static int overlay_audio(psxrc *image, const media_mapping *map, uint8_t *output
     return 1;
 }
 
+static const audio_cache *read_xa(psxrc *image, const media_mapping *map, unsigned coding)
+{
+    audio_cache *cache = read_audio(image, map->group);
+    if (!cache || cache->kind != AUDIO_XA4 || cache->coding != coding || map->frame >= cache->units)
+        return NULL;
+    return cache;
+}
+
+int psxrc_read_xa_template(psxrc *image, uint32_t lba, uint8_t output[PSXRC_SECTOR_BYTES])
+{
+    const media_mapping *map = find_mapping(image->audio, image->audios, lba);
+    if (!map)
+        return 0;
+    const uint8_t *data = read_template(image, lba, 0, NULL);
+    /* Prime PCM on the CD read-ahead thread without rebuilding ADPCM. */
+    if (!data || !xa_header(data) || !read_xa(image, map, data[19]))
+        return 0;
+    memcpy(output, data, PSXRC_SECTOR_BYTES);
+    return 1;
+}
+
+unsigned psxrc_read_xa_pcm(psxrc *image, uint32_t lba, unsigned expected_coding,
+                           int16_t *output, size_t capacity)
+{
+    const media_mapping *map = find_mapping(image->audio, image->audios, lba);
+    if (!map)
+        return 0;
+    const audio_cache *cache = read_xa(image, map, expected_coding);
+    if (!cache)
+        return 0;
+    unsigned samples = audio_samples_per_unit(cache->kind, cache->coding);
+    unsigned values = samples * audio_channels(cache->kind, cache->coding);
+    if (capacity < values)
+        return 0;
+    memcpy(output, cache->pcm + map->frame * values, values * sizeof(*output));
+    return samples;
+}
+
 int psxrc_read_sector(psxrc *image, uint32_t lba, uint8_t output[PSXRC_SECTOR_BYTES])
 {
     const media_mapping *map = find_mapping(image->video, image->videos, lba);
@@ -436,7 +572,7 @@ int psxrc_read_sector(psxrc *image, uint32_t lba, uint8_t output[PSXRC_SECTOR_BY
     group_cache *cache = read_group(image, map->group);
     str_header h;
     int valid = omitted_ecc ? !(data[18] & 0x20) && str_parse_template(data, &h) : str_parse(data, &h);
-    if (!cache || !valid || !read_frame(image, cache, map->frame) ||
+    if (!cache || !valid || !read_frame(image, cache, map->frame, lba) ||
         cache->length[map->frame] > h.length || cache->width != h.width || cache->height != h.height ||
         read16(cache->frame[map->frame]) > h.words || read16(cache->frame[map->frame] + 6) != h.version)
         return 0;

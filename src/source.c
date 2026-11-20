@@ -69,14 +69,14 @@ static size_t directory_length(const char *path)
 static FILE *open_relative(const char *cue, const char *name)
 {
     if (name[0] == '/' || name[0] == '\\' || (name[0] && name[1] == ':'))
-        return fopen(name, "rb");
+        return file_open(name, "rb");
     size_t directory = directory_length(cue);
     char *path = malloc(directory + strlen(name) + 1);
     if (!path)
         return NULL;
     memcpy(path, cue, directory);
     strcpy(path + directory, name);
-    FILE *file = fopen(path, "rb");
+    FILE *file = file_open(path, "rb");
     free(path);
     return file;
 }
@@ -114,7 +114,7 @@ static int finalize_cue(disc_source *source, const uint32_t *file_lengths)
 
 static int open_cue(disc_source *source, const char *path)
 {
-    FILE *cue = fopen(path, "rb");
+    FILE *cue = file_open(path, "rb");
     if (!cue)
         return 0;
     char line[4096], keyword[16], value[32];
@@ -124,13 +124,16 @@ static int open_cue(disc_source *source, const char *path)
     psxrc_track *track = NULL;
     source_part *part = NULL;
     int valid = 0;
+    int first_line = 1;
     while (fgets(line, sizeof(line), cue)) {
         if (!strchr(line, '\n') && !feof(cue))
             goto done;
         int used = 0;
-        if (sscanf(line, " %15s %n", keyword, &used) != 1)
+        const char *start = first_line && !strncmp(line, "\xef\xbb\xbf", 3) ? line + 3 : line;
+        first_line = 0;
+        if (sscanf(start, " %15s %n", keyword, &used) != 1)
             continue;
-        const char *fields = line + used;
+        const char *fields = start + used;
         if (same_word(keyword, "FILE")) {
             char name[4096];
             if (source->file_count == PSXRC_MAX_TRACKS ||
@@ -141,7 +144,15 @@ static int open_cue(disc_source *source, const char *path)
                 goto done;
             if (!same_word(value, "BINARY"))
                 goto done;
+#ifdef _WIN32
+            char *utf8_name = file_normalize_utf8(name);
+            if (!utf8_name)
+                goto done;
+            binary = open_relative(path, utf8_name);
+            free(utf8_name);
+#else
             binary = open_relative(path, name);
+#endif
             if (!binary)
                 goto done;
             unsigned index = source->file_count++;
@@ -194,7 +205,7 @@ done:
 
 static int open_flat(disc_source *source, const char *path, unsigned sector_bytes)
 {
-    FILE *file = fopen(path, "rb");
+    FILE *file = file_open(path, "rb");
     if (!file)
         return 0;
     source->files[source->file_count++] = file;
@@ -241,9 +252,9 @@ int source_open(disc_source *source, const char *path)
             return 0;
         memcpy(sub, path, n);
         memcpy(sub + n, ".sub", 5);
-        source->sub = fopen(sub, "rb");
+        source->sub = file_open(sub, "rb");
         memcpy(sub + n, ".sbi", 5);
-        FILE *sbi = fopen(sub, "rb");
+        FILE *sbi = file_open(sub, "rb");
         free(sub);
         if (sbi) {
             valid = import_sbi(source, sbi);

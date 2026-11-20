@@ -1,6 +1,7 @@
 /* PS1 BS v2/v3 syntax: https://psx-spx.consoledev.net/dev/ps1/cdr/cdromfileformats/streaming/ */
 #include "bs.h"
 #include "bytes.h"
+#include "psxrc.h"
 #include <string.h>
 
 /* First half of the orthonormal 8-point DCT basis, scaled by 2^14.
@@ -29,6 +30,11 @@ static const uint8_t quant_matrix[64] = {
     22,26,27,29,32,35,40,48, 26,27,29,32,35,40,48,58,
     26,27,29,34,38,46,56,69, 27,29,35,38,46,56,69,83
 };
+
+const uint8_t *psxrc_mdec_quant_matrix(void)
+{
+    return quant_matrix;
+}
 
 /* Positive run/level values in prefix order. The sign follows the prefix. */
 static const int16_t ac_codes[111] = {
@@ -61,6 +67,8 @@ typedef struct {
     unsigned bits, codes;
     int dc[3];
     int failed;
+    bs_mdec_fingerprint *trace;
+    uint64_t hash, coefficients;
 } bit_writer;
 
 static int divide_round(int64_t numerator, int denominator)
@@ -87,8 +95,23 @@ static void put_bits(bit_writer *w, unsigned value, unsigned count)
     }
 }
 
+static uint64_t hash_word(uint64_t hash, unsigned word)
+{
+    hash = (hash ^ (word & 255)) * UINT64_C(1099511628211);
+    return (hash ^ ((word >> 8) & 255)) * UINT64_C(1099511628211);
+}
+
+static void trace_word(bit_writer *w, unsigned word, int dc)
+{
+    if (!w->trace)
+        return;
+    w->hash = hash_word(w->hash, word);
+    w->coefficients = hash_word(w->coefficients, dc ? word & 1023 : word);
+}
+
 static void put_ac(bit_writer *w, unsigned run, int level)
 {
+    trace_word(w, (run << 10) | ((unsigned)level & 1023), 0);
     unsigned magnitude = (unsigned)(level < 0 ? -level : level);
     if (run < 32 && magnitude <= 40 && w->ac[run][magnitude].bits) {
         put_bits(w, w->ac[run][magnitude].value * 2 + (level < 0),
@@ -99,7 +122,7 @@ static void put_ac(bit_writer *w, unsigned run, int level)
     put_bits(w, run * 1024 + ((unsigned)level & 1023), 16);
 }
 
-static void put_dc(bit_writer *w, unsigned version, unsigned plane, int dc)
+static void put_dc(bit_writer *w, unsigned version, unsigned plane, unsigned quant, int dc)
 {
     static const uint8_t luma_code[]  = {4, 0, 1, 5, 6, 14, 30, 62, 126};
     static const uint8_t luma_bits[]  = {3, 2, 2, 3, 3,  4,  5,  6,   7};
@@ -107,11 +130,13 @@ static void put_dc(bit_writer *w, unsigned version, unsigned plane, int dc)
     static const uint8_t chroma_bits[]= {2, 2, 2, 3, 4,  5,  6,  7,   8};
     if (version == 2) {
         put_bits(w, (unsigned)dc & 1023, 10);
+        trace_word(w, (quant << 10) | ((unsigned)dc & 1023), 1);
         return;
     }
     dc = divide_round(dc, 4);
     if (dc > 127)
         dc = 127;
+    trace_word(w, (quant << 10) | ((unsigned)(dc * 4) & 1023), 1);
     int delta = dc - w->dc[plane];
     w->dc[plane] = dc;
     unsigned size = 0;
@@ -181,7 +206,7 @@ static void encode_block(bit_writer *w, const bs_picture *picture, unsigned plan
         if (level > 510)
             level = 510;
         if (i == 0) {
-            put_dc(w, version, plane, level);
+            put_dc(w, version, plane, quant, level);
             ++w->codes;
         } else if (level) {
             put_ac(w, run, level);
@@ -192,17 +217,21 @@ static void encode_block(bit_writer *w, const bs_picture *picture, unsigned plan
         }
     }
     put_bits(w, 2, 2);
+    trace_word(w, 0xfe00, 0);
     ++w->codes;
 }
 
-size_t bs_encode(const bs_picture *picture, unsigned version, unsigned quant,
-                 unsigned word_limit, uint8_t *output, size_t capacity)
+size_t bs_encode_fingerprint(const bs_picture *picture, unsigned version, unsigned quant,
+                             unsigned word_limit, uint8_t *output, size_t capacity,
+                             bs_mdec_fingerprint *fingerprint)
 {
     if (!picture || !output || !picture->width || !picture->height ||
         picture->width > 1024 || picture->height > 1024 ||
         (version != 2 && version != 3) || !quant || quant > 63 || capacity < 12)
         return 0;
-    bit_writer w = { .output = output, .capacity = capacity & ~(size_t)3, .size = 8 };
+    bit_writer w = { .output = output, .capacity = capacity & ~(size_t)3, .size = 8,
+                     .trace = fingerprint, .hash = UINT64_C(14695981039346656037),
+                     .coefficients = UINT64_C(14695981039346656037) };
     unsigned code = 0;
     for (size_t group = 0; group < sizeof(ac_groups) / sizeof(ac_groups[0]); ++group) {
         for (unsigned i = 0; i < ac_groups[group].count; ++i, ++code) {
@@ -235,5 +264,16 @@ size_t bs_encode(const bs_picture *picture, unsigned version, unsigned quant,
     write16(output + 2, 0x3800);
     write16(output + 4, quant);
     write16(output + 6, version);
+    if (fingerprint) {
+        fingerprint->hash = w.hash;
+        fingerprint->coefficients = w.coefficients;
+        fingerprint->words = w.codes;
+    }
     return w.size;
+}
+
+size_t bs_encode(const bs_picture *picture, unsigned version, unsigned quant,
+                 unsigned word_limit, uint8_t *output, size_t capacity)
+{
+    return bs_encode_fingerprint(picture, version, quant, word_limit, output, capacity, NULL);
 }

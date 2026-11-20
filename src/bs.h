@@ -10,8 +10,16 @@ typedef struct {
     unsigned width, height;
 } bs_picture;
 
+typedef struct {
+    uint64_t hash, coefficients;
+    unsigned words;
+} bs_mdec_fingerprint;
+
 /* Returns the padded BS length, or zero if either budget cannot be met. */
 size_t bs_encode(const bs_picture *picture, unsigned version, unsigned quant,
                  unsigned word_limit, uint8_t *output, size_t capacity);
+size_t bs_encode_fingerprint(const bs_picture *picture, unsigned version, unsigned quant,
+                             unsigned word_limit, uint8_t *output, size_t capacity,
+                             bs_mdec_fingerprint *fingerprint);
 
 #endif

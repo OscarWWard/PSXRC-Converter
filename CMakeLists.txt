@@ -25,7 +25,14 @@ if(OPUS_SOURCE)
         set(OPUS_BUILD_PROGRAMS OFF)
         set(OPUS_BUILD_TESTING OFF)
         set(OPUS_DISABLE_INTRINSICS ON)
-        add_subdirectory("${OPUS_SOURCE}" opus EXCLUDE_FROM_ALL)
+        set(opus_checkout "${OPUS_SOURCE}")
+        if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+            set(PSXRC_OPUS_SOURCE "${OPUS_SOURCE}")
+            set(PSXRC_OPUS_DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/opus-reference")
+            include(cmake/prepare-reference-opus.cmake)
+            set(opus_checkout "${PSXRC_OPUS_DESTINATION}")
+        endif()
+        add_subdirectory("${opus_checkout}" opus EXCLUDE_FROM_ALL)
     endfunction()
     add_fixed_point_opus()
     set_target_properties(opus PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -40,6 +47,9 @@ endif()
 add_executable(psxrc src/main.c src/audio_convert.c src/file_io.c src/source.c src/video_convert.c src/writer.c)
 target_include_directories(psxrc PRIVATE "${FFMPEG_INCLUDE_DIR}" "${ZSTD_INCLUDE_DIR}")
 target_link_libraries(psxrc PRIVATE psxrc_reader)
+if(MINGW)
+    target_link_options(psxrc PRIVATE -municode)
+endif()
 if(LIBCHDR_SOURCE)
     set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
     set(CHDR_WANT_TESTS OFF)
@@ -50,6 +60,50 @@ if(LIBCHDR_SOURCE)
 endif()
 if(NOT WIN32)
     target_compile_definitions(psxrc PRIVATE _FILE_OFFSET_BITS=64 _POSIX_C_SOURCE=200809L)
+endif()
+
+if(WIN32 AND CMAKE_HOST_WIN32)
+    set(PSXRC_RUNTIME_DLL_DIRS "" CACHE STRING "Additional directories containing Windows runtime DLLs")
+    set(runtime_dirs ${PSXRC_RUNTIME_DLL_DIRS})
+    foreach(library AVCODEC_LIBRARY AVUTIL_LIBRARY ZSTD_LIBRARY OPUS_LIBRARY)
+        if(${library})
+            get_filename_component(library_dir "${${library}}" DIRECTORY)
+            get_filename_component(bin_dir "${library_dir}/../bin" ABSOLUTE)
+            list(APPEND runtime_dirs "${library_dir}" "${bin_dir}")
+        endif()
+    endforeach()
+    get_filename_component(compiler_dir "${CMAKE_C_COMPILER}" DIRECTORY)
+    list(APPEND runtime_dirs "${compiler_dir}")
+    list(REMOVE_DUPLICATES runtime_dirs)
+    set(runtime_script "${CMAKE_CURRENT_SOURCE_DIR}/windows/stage-runtime.cmake")
+    set(runtime_command "${CMAKE_COMMAND}" "-DPSXRC_EXECUTABLE=$<TARGET_FILE:psxrc>"
+        "-DPSXRC_SCAN_DIR=${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/psxrc-runtime/$<CONFIG>")
+    if(MINGW)
+        list(APPEND runtime_command "-DPSXRC_OBJDUMP=${CMAKE_OBJDUMP}")
+    endif()
+    set_property(TARGET psxrc APPEND PROPERTY LINK_DEPENDS "${runtime_script}")
+    add_custom_command(TARGET psxrc POST_BUILD
+        COMMAND ${runtime_command} "-DPSXRC_SEARCH_DIRS=${runtime_dirs}"
+            "-DPSXRC_DESTINATION=$<TARGET_FILE_DIR:psxrc>" -P "${runtime_script}"
+        VERBATIM)
+
+    find_program(PSXRC_POWERSHELL NAMES powershell pwsh
+        HINTS "$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0")
+    if(PSXRC_POWERSHELL)
+        set(bundle_dir "${CMAKE_CURRENT_BINARY_DIR}/windows-bundle/$<CONFIG>")
+        set(gui_source_dir "${CMAKE_CURRENT_SOURCE_DIR}/windows")
+        add_custom_command(OUTPUT "${bundle_dir}/psxrc-gui.exe"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${bundle_dir}"
+            COMMAND "${PSXRC_POWERSHELL}" -NoProfile -ExecutionPolicy Bypass
+                -File "${gui_source_dir}/build-gui.ps1" -OutputPath "${bundle_dir}/psxrc-gui.exe"
+            DEPENDS "${gui_source_dir}/build-gui.ps1" "${gui_source_dir}/ConverterForm.cs"
+            VERBATIM)
+        add_custom_target(psxrc_windows_bundle
+            COMMAND ${runtime_command} "-DPSXRC_SEARCH_DIRS=${runtime_dirs}"
+                "-DPSXRC_DESTINATION=${bundle_dir}" -P "${runtime_script}"
+            DEPENDS psxrc "${bundle_dir}/psxrc-gui.exe"
+            VERBATIM)
+    endif()
 endif()
 
 include(CTest)

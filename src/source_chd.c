@@ -2,6 +2,7 @@
  * https://github.com/mamedev/mame/blob/master/src/lib/util/cdrom.cpp
  */
 #include "source.h"
+#include "file_io.h"
 #include <libchdr/chd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +34,11 @@ static int sub_mode(const char *type)
 int source_chd_open(disc_source *source, const char *path)
 {
     chd_file *chd;
-    if (chd_open(path, CHD_OPEN_READ, NULL, &chd) != CHDERR_NONE)
+    FILE *file = file_open(path, "rb");
+    if (!file)
+        return 0;
+    source->files[source->file_count++] = file;
+    if (chd_open_file(file, CHD_OPEN_READ, NULL, &chd) != CHDERR_NONE)
         return 0;
     source->chd = chd;
     const chd_header *header = chd_get_header(chd);

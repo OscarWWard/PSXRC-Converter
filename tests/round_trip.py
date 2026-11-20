@@ -33,6 +33,12 @@ def check_video(root, cli, maker, version):
     run(cli, "convert", cue, lossless, "--preset", "lossless")
     run(cli, "extract-bin", lossless, rebuilt)
     assert rebuilt.read_bytes() == source
+    tuned = root / f"tuned-{version}.psxrc"
+    run(cli, "convert", cue, tuned, "--preset", "lossless", "--zstd-level", "15")
+    rebuilt.unlink()
+    run(cli, "extract-bin", tuned, rebuilt)
+    assert rebuilt.read_bytes() == source
+    run(cli, "convert", cue, root / "bad-level.psxrc", "--zstd-level", "20", expect=2)
     run(cli, "convert", cue, lossless, expect=1)
     rebuilt.unlink()
     run(cli, "convert", cue, video, "--preset", "balanced")
@@ -62,6 +68,36 @@ def check_video(root, cli, maker, version):
     last_video = max(i for i in range(count) if source[i * SECTOR + 24 : i * SECTOR + 28] == STR)
     run(cli, "convert", cue, fallback, "--str", f"0:{last_video}")
     assert "STR replacement sectors: 0" in run(cli, "inspect", fallback)
+
+    if str(version) == "2":
+        profiles = (
+            ("qp", "--video-qp", "20", "--h264-preset", "fast", "--h264-tune", "film",
+             "--h264-profile", "main", "--video-refs", "2", "--h264-extra", "aq-mode=2:trellis=1"),
+            ("abr", "--video-kbps", "750", "--video-vbv-rate", "1500",
+             "--video-vbv-buffer", "1000", "--h264-level", "3.0"),
+        )
+        for name, *settings in profiles:
+            custom = root / f"{name}.psxrc"
+            run(cli, "convert", cue, custom, *settings, "--video-mse", "512", "--mdec-hints")
+            report = run(cli, "inspect", custom)
+            assert "STR replacement sectors: 0" not in report
+            assert "MDEC hints: yes" in report
+            run(cli, "verify", custom)
+        for setting in ("bframes=2", "subme=invalid"):
+            run(cli, "convert", cue, root / "invalid-picture.psxrc", "--h264-extra", setting, expect=2)
+
+
+def check_unicode_paths(root, cli):
+    folder = root / "ディスク test"
+    folder.mkdir()
+    binary = folder / "トラック.bin"
+    cue = folder / "入力.cue"
+    image = folder / "圧縮.psxrc"
+    binary.write_bytes(bytes(SECTOR * 9))
+    cue.write_text('FILE "トラック.bin" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n',
+                   encoding="utf-8-sig")
+    run(cli, "convert", cue, image, "--preset", "lossless")
+    run(cli, "verify", image)
 
 
 def check_mixed_mode(root, cli):
@@ -139,3 +175,4 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path(sys.argv[1]).resolve().parent)
         check_video(tmp, sys.argv[1], sys.argv[2], bs_version)
     check_mixed_mode(tmp, sys.argv[1])
     check_audio(tmp, sys.argv[1], sys.argv[3])
+    check_unicode_paths(tmp, sys.argv[1])

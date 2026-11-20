@@ -2,6 +2,7 @@
 #include "source.h"
 #include "str.h"
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #ifdef _WIN32
 #include <windows.h>
@@ -106,9 +107,10 @@ int main(int argc, char **argv)
 {
     unsigned first, count;
     char extra;
-    if (argc != 4 || sscanf(argv[3], "%6u:%6u%c", &first, &count, &extra) != 2 ||
+    int all = argc == 5 && !strcmp(argv[4], "--all-sectors");
+    if ((argc != 4 && !all) || sscanf(argv[3], "%6u:%6u%c", &first, &count, &extra) != 2 ||
         !count || first >= PSXRC_MAX_SECTORS || count > PSXRC_MAX_SECTORS - first) {
-        fputs("Usage: psxrc_bench BASELINE.chd IMAGE.psxrc FIRST_LBA:COUNT\n", stderr);
+        fputs("Usage: psxrc_bench BASELINE.chd IMAGE.psxrc FIRST_LBA:COUNT [--all-sectors]\n", stderr);
         return 2;
     }
     uint32_t *seeks = malloc(count * sizeof(*seeks));
@@ -120,14 +122,14 @@ int main(int argc, char **argv)
     for (uint32_t i = 0; i < count && ok; ++i) {
         uint8_t data[PSXRC_SECTOR_BYTES + PSXRC_SUB_RECORD_BYTES];
         ok = read_one(&in, first + i, data);
-        if (ok && str_has_signature(data))
+        if (ok && (all || str_has_signature(data)))
             seeks[num_seeks++] = first + i;
     }
     stop(&in);
     ok = ok && num_seeks && measure(argv[1], 0, first, count, seeks, num_seeks) &&
          measure(argv[2], 1, first, count, seeks, num_seeks);
     if (!ok)
-        fputs("Could not complete the benchmark on the selected STR range.\n", stderr);
+        fputs("Could not complete the benchmark on the selected sector range.\n", stderr);
     free(seeks);
     return ok ? 0 : 1;
 }

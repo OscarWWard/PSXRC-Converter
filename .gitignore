@@ -1,5 +1,9 @@
 /build*/
+/[Rr]elease/
+/.tooling/
+/testroms/
 *.psxrc
 *.bin
 *.chd
+*.iso
 __pycache__/
